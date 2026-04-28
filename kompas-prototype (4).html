@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#111">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Kompas</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #111;
+    min-height: 100dvh;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 10vh;
+    overflow: hidden;
+  }
+  #ring {
+    width: min(82vw, 72vh);
+    height: min(82vw, 72vh);
+    border-radius: 50%;
+    border: min(13vw, 11vh) solid #f87171;
+    transition: border-color 0.15s linear, box-shadow 0.15s linear;
+  }
+  #overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.88);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 1.5rem; z-index: 10;
+  }
+  #overlay p { font-family: sans-serif; color: #aaa; font-size: 15px; text-align: center; max-width: 260px; line-height: 1.6; }
+  #permission-btn { font-family: sans-serif; font-size: 16px; background: #fff; color: #111; border: none; padding: 14px 32px; border-radius: 50px; cursor: pointer; font-weight: 600; }
+  #settings {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    background: #1a1a1a; border-top: 1px solid #2a2a2a;
+    padding: 1.4rem 1.6rem 2rem;
+    transform: translateY(100%); transition: transform 0.3s ease;
+    z-index: 20; font-family: sans-serif;
+  }
+  #settings.open { transform: translateY(0); }
+  #settings h2 { font-size: 12px; color: #555; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 1.2rem; }
+  .row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .row label { font-size: 13px; color: #888; min-width: 100px; }
+  .row input[type=range] { flex: 1; -webkit-appearance: none; background: #333; height: 4px; border-radius: 2px; outline: none; }
+  .row input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%; background: #fff; cursor: pointer; }
+  .row span { font-size: 13px; color: #ccc; min-width: 38px; text-align: right; }
+  #close-settings { font-family: sans-serif; font-size: 14px; background: #2a2a2a; color: #ccc; border: none; padding: 10px 24px; border-radius: 8px; cursor: pointer; margin-top: 4px; width: 100%; }
+  #tap-hint { position: fixed; bottom: 1.2rem; font-family: sans-serif; font-size: 11px; color: #222; letter-spacing: 0.05em; pointer-events: none; }
+</style>
+</head>
+<body>
+
+<div id="ring"></div>
+<span id="tap-hint">tik 3× voor instellingen</span>
+
+<div id="settings">
+  <h2>Instellingen</h2>
+  <div class="row">
+    <label>Doelrichting</label>
+    <input type="range" id="target-slider" min="0" max="359" value="0" step="1" oninput="onTargetChange()">
+    <span id="target-val">0°</span>
+  </div>
+  <div class="row">
+    <label>Tolerantie</label>
+    <input type="range" id="tol-slider" min="10" max="90" value="45" step="5" oninput="onTolChange()">
+    <span id="tol-val">45°</span>
+  </div>
+  <button id="close-settings" onclick="closeSettings()">Sluiten</button>
+</div>
+
+<div id="overlay" style="display:none">
+  <p>Tik op de knop om de kompas-sensor te activeren</p>
+  <button id="permission-btn" onclick="requestPermission()">Activeer kompas</button>
+</div>
+
+<script>
+  let targetDeg = 0;
+  let tolerance = 45;
+  let sensorActive = false;
+  let tapCount = 0;
+  let tapTimer = null;
+
+  // Smoothed heading — exponential moving average on sin/cos components
+  // Alpha close to 0 = very smooth but slow; 0.08 gives stable but responsive feel
+  const ALPHA = 0.06;
+  let smoothSin = null;
+  let smoothCos = null;
+
+  const ring = document.getElementById('ring');
+  const settings = document.getElementById('settings');
+  const overlay = document.getElementById('overlay');
+
+  function angleDiff(a, b) {
+    let d = Math.abs(a - b) % 360;
+    return d > 180 ? 360 - d : d;
+  }
+
+  // Colour zones (t = 0..1, where 1 = at tolerance boundary):
+  // 0–0.20 → pure green  (20% green zone)
+  // 0.20–0.60 → green→yellow→orange gradient (40% transition toward green side)
+  // 0.60–1.0 → orange→red (remaining transition)
+  // beyond 1 → pure red (40% of the total range outside tolerance is red)
+  function diffToColor(diff) {
+    // Normalise: t=0 is perfect, t=1 is at tolerance edge, t>1 is beyond
+    const t = diff / tolerance;
+
+    let r, g, b = 0;
+
+    if (t <= 0.20) {
+      // Pure green
+      r = 30; g = 200; b = 80;
+    } else if (t <= 0.50) {
+      // Green → yellow
+      const s = (t - 0.20) / 0.30;
+      r = Math.round(30 + s * 225);
+      g = Math.round(200 + s * 15);
+      b = 0;
+    } else if (t <= 0.80) {
+      // Yellow → orange
+      const s = (t - 0.50) / 0.30;
+      r = 255;
+      g = Math.round(215 - s * 145);
+      b = 0;
+    } else {
+      // Orange → red (and stays red beyond t=1)
+      const s = Math.min((t - 0.80) / 0.20, 1);
+      r = 255;
+      g = Math.round(70 - s * 70);
+      b = 0;
+    }
+
+    return { r, g, b };
+  }
+
+  function applyColor(diff) {
+    const { r, g, b } = diffToColor(diff);
+    ring.style.borderColor = `rgb(${r},${g},${b})`;
+    ring.style.boxShadow = `0 0 55px rgba(${r},${g},${b},0.4), 0 0 110px rgba(${r},${g},${b},0.15)`;
+  }
+
+  // Only one sensor source wins — whichever fires first
+  let sensorSource = null;
+
+  function onOrientation(e, source) {
+    // Lock to first sensor source to prevent flicker from two events
+    if (sensorSource && sensorSource !== source) return;
+
+    let raw = null;
+    if (source === 'ios' && e.webkitCompassHeading !== undefined) {
+      raw = e.webkitCompassHeading;
+    } else if (source === 'absolute' && e.alpha !== null) {
+      raw = (360 - e.alpha) % 360;
+    } else if (source === 'generic' && e.alpha !== null) {
+      raw = (360 - e.alpha) % 360;
+    }
+    if (raw === null) return;
+
+    if (!sensorSource) sensorSource = source;
+    if (!sensorActive) { sensorActive = true; stopDemo(); }
+
+    // Exponential moving average on unit circle components
+    const rad = raw * Math.PI / 180;
+    if (smoothSin === null) {
+      smoothSin = Math.sin(rad);
+      smoothCos = Math.cos(rad);
+    } else {
+      smoothSin = ALPHA * Math.sin(rad) + (1 - ALPHA) * smoothSin;
+      smoothCos = ALPHA * Math.cos(rad) + (1 - ALPHA) * smoothCos;
+    }
+
+    const smoothed = ((Math.atan2(smoothSin, smoothCos) * 180 / Math.PI) + 360) % 360;
+    applyColor(angleDiff(smoothed, targetDeg));
+  }
+
+  function startListening() {
+    // Listen to both but lock to first one that gives data
+    window.addEventListener('deviceorientationabsolute', e => onOrientation(e, 'absolute'), true);
+    window.addEventListener('deviceorientation', e => {
+      // On iOS, deviceorientation carries webkitCompassHeading
+      const src = (e.webkitCompassHeading !== undefined) ? 'ios' : 'generic';
+      onOrientation(e, src);
+    }, true);
+  }
+
+  function requestPermission() {
+    DeviceOrientationEvent.requestPermission()
+      .then(state => {
+        if (state === 'granted') { overlay.style.display = 'none'; startListening(); }
+      }).catch(console.error);
+  }
+
+  if (typeof DeviceOrientationEvent !== 'undefined') {
+    if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+      overlay.style.display = 'flex';
+    } else {
+      startListening();
+    }
+  }
+
+  // Demo
+  let demoAngle = 0, demoFrame = null, lastTime = 0;
+  function runDemo(ts) {
+    if (sensorActive) return;
+    if (ts - lastTime > 30) { demoAngle = (demoAngle + 1.2) % 360; applyColor(angleDiff(demoAngle, targetDeg)); lastTime = ts; }
+    demoFrame = requestAnimationFrame(runDemo);
+  }
+  function stopDemo() { if (demoFrame) cancelAnimationFrame(demoFrame); }
+  demoFrame = requestAnimationFrame(runDemo);
+
+  // Triple tap
+  document.body.addEventListener('click', () => {
+    tapCount++;
+    clearTimeout(tapTimer);
+    tapTimer = setTimeout(() => { tapCount = 0; }, 600);
+    if (tapCount >= 3) { tapCount = 0; settings.classList.add('open'); }
+  });
+
+  function closeSettings() { settings.classList.remove('open'); }
+
+  function onTargetChange() {
+    targetDeg = parseInt(document.getElementById('target-slider').value);
+    document.getElementById('target-val').textContent = targetDeg + '°';
+  }
+
+  function onTolChange() {
+    tolerance = parseInt(document.getElementById('tol-slider').value);
+    document.getElementById('tol-val').textContent = tolerance + '°';
+  }
+</script>
+</body>
+</html>
